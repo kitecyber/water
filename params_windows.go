@@ -24,6 +24,8 @@ type PlatformSpecificParams struct {
 	// https://github.com/OpenVPN/tap-windows6/blob/master/src/device.c#L431
 	// and https://github.com/songgao/water/pull/13#issuecomment-270341777
 	Network string
+
+	Name string
 }
 
 func defaultPlatformSpecificParams() PlatformSpecificParams {

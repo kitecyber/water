@@ -1,313 +1,242 @@
 package water
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"net"
+	"os"
 	"sync"
-	"syscall"
-	"unsafe"
+	"sync/atomic"
+	"time"
+	_ "unsafe"
 
-	"golang.org/x/sys/windows/registry"
+	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wintun"
 )
 
-// To use it with windows, you need a tap driver installed on windows.
-// https://github.com/OpenVPN/tap-windows6
-// or just install OpenVPN
-// https://github.com/OpenVPN/openvpn
+type Event int
 
 const (
-	// tapDriverKey is the location of the TAP driver key.
-	tapDriverKey = `SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}`
-	// netConfigKey is the location of the TAP adapter's network config.
-	netConfigKey = `SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}`
+	EventUp = 1 << iota
+	EventDown
+	EventMTUUpdate
 )
+
+const (
+	rateMeasurementGranularity = uint64((time.Second / 2) / time.Nanosecond)
+	spinloopRateThreshold      = 800000000 / 8                                   // 800mbps
+	spinloopDuration           = uint64(time.Millisecond / 80 / time.Nanosecond) // ~1gbit/s
+)
+
+type rateJuggler struct {
+	current       uint64
+	nextByteCount uint64
+	nextStartTime int64
+	changing      int32
+}
+
+type NativeTun struct {
+	wt        *wintun.Adapter
+	name      string
+	handle    windows.Handle
+	rate      rateJuggler
+	session   wintun.Session
+	readWait  windows.Handle
+	events    chan Event
+	running   sync.WaitGroup
+	closeOnce sync.Once
+	close     int32
+	forcedMTU int
+}
 
 var (
-	errIfceNameNotFound = errors.New("Failed to find the name of interface")
-	// Device Control Codes
-	tap_win_ioctl_get_mac             = tap_control_code(1, 0)
-	tap_win_ioctl_get_version         = tap_control_code(2, 0)
-	tap_win_ioctl_get_mtu             = tap_control_code(3, 0)
-	tap_win_ioctl_get_info            = tap_control_code(4, 0)
-	tap_ioctl_config_point_to_point   = tap_control_code(5, 0)
-	tap_ioctl_set_media_status        = tap_control_code(6, 0)
-	tap_win_ioctl_config_dhcp_masq    = tap_control_code(7, 0)
-	tap_win_ioctl_get_log_line        = tap_control_code(8, 0)
-	tap_win_ioctl_config_dhcp_set_opt = tap_control_code(9, 0)
-	tap_ioctl_config_tun              = tap_control_code(10, 0)
-	// w32 api
-	file_device_unknown = uint32(0x00000022)
-	nCreateEvent,
-	nResetEvent,
-	nGetOverlappedResult uintptr
+	WintunTunnelType          = "WireGuard"
+	WintunStaticRequestedGUID *windows.GUID
 )
 
-func init() {
-	k32, err := syscall.LoadLibrary("kernel32.dll")
-	if err != nil {
-		panic("LoadLibrary " + err.Error())
-	}
-	defer syscall.FreeLibrary(k32)
+//go:linkname procyield runtime.procyield
+func procyield(cycles uint32)
 
-	nCreateEvent = getProcAddr(k32, "CreateEventW")
-	nResetEvent = getProcAddr(k32, "ResetEvent")
-	nGetOverlappedResult = getProcAddr(k32, "GetOverlappedResult")
+//go:linkname nanotime runtime.nanotime
+func nanotime() int64
+
+func (tun *NativeTun) Name() (string, error) {
+	return tun.name, nil
 }
 
-func getProcAddr(lib syscall.Handle, name string) uintptr {
-	addr, err := syscall.GetProcAddress(lib, name)
-	if err != nil {
-		panic(name + " " + err.Error())
-	}
-	return addr
-}
-
-func resetEvent(h syscall.Handle) error {
-	r, _, err := syscall.Syscall(nResetEvent, 1, uintptr(h), 0, 0)
-	if r == 0 {
-		return err
-	}
+func (tun *NativeTun) File() *os.File {
 	return nil
 }
 
-func getOverlappedResult(h syscall.Handle, overlapped *syscall.Overlapped) (int, error) {
-	var n int
-	r, _, err := syscall.Syscall6(nGetOverlappedResult, 4,
-		uintptr(h),
-		uintptr(unsafe.Pointer(overlapped)),
-		uintptr(unsafe.Pointer(&n)), 1, 0, 0)
-	if r == 0 {
-		return n, err
-	}
-
-	return n, nil
+func (tun *NativeTun) Events() chan Event {
+	return tun.events
 }
 
-func newOverlapped() (*syscall.Overlapped, error) {
-	var overlapped syscall.Overlapped
-	r, _, err := syscall.Syscall6(nCreateEvent, 4, 0, 1, 0, 0, 0, 0)
-	if r == 0 {
-		return nil, err
-	}
-	overlapped.HEvent = syscall.Handle(r)
-	return &overlapped, nil
-}
-
-type wfile struct {
-	fd syscall.Handle
-	rl sync.Mutex
-	wl sync.Mutex
-	ro *syscall.Overlapped
-	wo *syscall.Overlapped
-}
-
-func (f *wfile) Close() error {
-	return syscall.Close(f.fd)
-}
-
-func (f *wfile) Write(b []byte) (int, error) {
-	f.wl.Lock()
-	defer f.wl.Unlock()
-
-	if err := resetEvent(f.wo.HEvent); err != nil {
-		return 0, err
-	}
-	var n uint32
-	err := syscall.WriteFile(f.fd, b, &n, f.wo)
-	if err != nil && err != syscall.ERROR_IO_PENDING {
-		return int(n), err
-	}
-	return getOverlappedResult(f.fd, f.wo)
-}
-
-func (f *wfile) Read(b []byte) (int, error) {
-	f.rl.Lock()
-	defer f.rl.Unlock()
-
-	if err := resetEvent(f.ro.HEvent); err != nil {
-		return 0, err
-	}
-	var done uint32
-	err := syscall.ReadFile(f.fd, b, &done, f.ro)
-	if err != nil && err != syscall.ERROR_IO_PENDING {
-		return int(done), err
-	}
-	return getOverlappedResult(f.fd, f.ro)
-}
-
-func ctl_code(device_type, function, method, access uint32) uint32 {
-	return (device_type << 16) | (access << 14) | (function << 2) | method
-}
-
-func tap_control_code(request, method uint32) uint32 {
-	return ctl_code(file_device_unknown, request, method, 0)
-}
-
-// getdeviceid finds out a TAP device from registry, it *may* requires privileged right to prevent some weird issue.
-func getdeviceid(componentID string, interfaceName string) (deviceid string, err error) {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, tapDriverKey, registry.READ)
-	if err != nil {
-		return "", fmt.Errorf("Failed to open the adapter registry, TAP driver may be not installed, %v", err)
-	}
-	defer k.Close()
-	// read all subkeys, it should not return an err here
-	keys, err := k.ReadSubKeyNames(-1)
-	if err != nil {
-		return "", err
-	}
-	// find the one matched ComponentId
-	for _, v := range keys {
-		key, err := registry.OpenKey(registry.LOCAL_MACHINE, tapDriverKey+"\\"+v, registry.READ)
-		if err != nil {
-			continue
+func (tun *NativeTun) Close() error {
+	var err error
+	tun.closeOnce.Do(func() {
+		atomic.StoreInt32(&tun.close, 1)
+		windows.SetEvent(tun.readWait)
+		tun.running.Wait()
+		tun.session.End()
+		if tun.wt != nil {
+			tun.wt.Close()
 		}
-		val, _, err := key.GetStringValue("ComponentId")
-		if err != nil {
-			key.Close()
-			continue
+		close(tun.events)
+	})
+	return err
+}
+
+func (tun *NativeTun) MTU() (int, error) {
+	return tun.forcedMTU, nil
+}
+
+// TODO: This is a temporary hack. We really need to be monitoring the interface in real time and adapting to MTU changes.
+func (tun *NativeTun) ForceMTU(mtu int) {
+	update := tun.forcedMTU != mtu
+	tun.forcedMTU = mtu
+	if update {
+		tun.events <- EventMTUUpdate
+	}
+}
+
+// Note: Read() and Write() assume the caller comes only from a single thread; there's no locking.
+
+func (tun *NativeTun) Read(buff []byte) (int, error) {
+	tun.running.Add(1)
+	defer tun.running.Done()
+retry:
+	if atomic.LoadInt32(&tun.close) == 1 {
+		return 0, os.ErrClosed
+	}
+	start := nanotime()
+	shouldSpin := atomic.LoadUint64(&tun.rate.current) >= spinloopRateThreshold && uint64(start-atomic.LoadInt64(&tun.rate.nextStartTime)) <= rateMeasurementGranularity*2
+	for {
+		if atomic.LoadInt32(&tun.close) == 1 {
+			return 0, os.ErrClosed
 		}
-		if val == componentID {
-			val, _, err = key.GetStringValue("NetCfgInstanceId")
-			if err != nil {
-				key.Close()
-				continue
+		packet, err := tun.session.ReceivePacket()
+		switch err {
+		case nil:
+			packetSize := len(packet)
+			copy(buff, packet)
+			tun.session.ReleaseReceivePacket(packet)
+			tun.rate.update(uint64(packetSize))
+			return packetSize, nil
+		case windows.ERROR_NO_MORE_ITEMS:
+			if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {
+				windows.WaitForSingleObject(tun.readWait, windows.INFINITE)
+				goto retry
 			}
-			if len(interfaceName) > 0 {
-				key2 := fmt.Sprintf("%s\\%s\\Connection", netConfigKey, val)
-				k2, err := registry.OpenKey(registry.LOCAL_MACHINE, key2, registry.READ)
-				if err != nil {
-					continue
-				}
-				defer k2.Close()
-				val, _, err := k2.GetStringValue("Name")
-				if err != nil || val != interfaceName {
-					continue
-				}
-			}
-			key.Close()
-			return val, nil
+			procyield(1)
+			continue
+		case windows.ERROR_HANDLE_EOF:
+			return 0, os.ErrClosed
+		case windows.ERROR_INVALID_DATA:
+			return 0, errors.New("Send ring corrupt")
 		}
-		key.Close()
+		return 0, fmt.Errorf("Read failed: %w", err)
 	}
-	if len(interfaceName) > 0 {
-		return "", fmt.Errorf("Failed to find the tap device in registry with specified ComponentId '%s' and InterfaceName '%s', TAP driver may be not installed or you may have specified an interface name that doesn't exist", componentID, interfaceName)
-	}
-
-	return "", fmt.Errorf("Failed to find the tap device in registry with specified ComponentId '%s', TAP driver may be not installed", componentID)
 }
 
-// setStatus is used to bring up or bring down the interface
-func setStatus(fd syscall.Handle, status bool) error {
-	var bytesReturned uint32
-	rdbbuf := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
-	code := []byte{0x00, 0x00, 0x00, 0x00}
-	if status {
-		code[0] = 0x01
-	}
-	return syscall.DeviceIoControl(fd, tap_ioctl_set_media_status, &code[0], uint32(4), &rdbbuf[0], uint32(len(rdbbuf)), &bytesReturned, nil)
-}
-
-// setTUN is used to configure the IP address in the underlying driver when using TUN
-func setTUN(fd syscall.Handle, network string) error {
-	var bytesReturned uint32
-	rdbbuf := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
-
-	localIP, remoteNet, err := net.ParseCIDR(network)
-	if err != nil {
-		return fmt.Errorf("Failed to parse network CIDR in config, %v", err)
-	}
-	if localIP.To4() == nil {
-		return fmt.Errorf("Provided network(%s) is not a valid IPv4 address", network)
-	}
-	code2 := make([]byte, 0, 12)
-	code2 = append(code2, localIP.To4()[:4]...)
-	code2 = append(code2, remoteNet.IP.To4()[:4]...)
-	code2 = append(code2, remoteNet.Mask[:4]...)
-	if len(code2) != 12 {
-		return fmt.Errorf("Provided network(%s) is not valid", network)
-	}
-	if err := syscall.DeviceIoControl(fd, tap_ioctl_config_tun, &code2[0], uint32(12), &rdbbuf[0], uint32(len(rdbbuf)), &bytesReturned, nil); err != nil {
-		return err
-	}
+func (tun *NativeTun) Flush() error {
 	return nil
+}
+
+func (tun *NativeTun) Write(buff []byte) (int, error) {
+	tun.running.Add(1)
+	defer tun.running.Done()
+	if atomic.LoadInt32(&tun.close) == 1 {
+		return 0, os.ErrClosed
+	}
+
+	packetSize := len(buff)
+	tun.rate.update(uint64(packetSize))
+
+	packet, err := tun.session.AllocateSendPacket(packetSize)
+	if err == nil {
+		copy(packet, buff)
+		tun.session.SendPacket(packet)
+		return packetSize, nil
+	}
+	switch err {
+	case windows.ERROR_HANDLE_EOF:
+		return 0, os.ErrClosed
+	case windows.ERROR_BUFFER_OVERFLOW:
+		return 0, nil // Dropping when ring is full.
+	}
+	return 0, fmt.Errorf("Write failed: %w", err)
+}
+
+// LUID returns Windows interface instance ID.
+func (tun *NativeTun) LUID() uint64 {
+	tun.running.Add(1)
+	defer tun.running.Done()
+	if atomic.LoadInt32(&tun.close) == 1 {
+		return 0
+	}
+	return tun.wt.LUID()
+}
+
+// RunningVersion returns the running version of the Wintun driver.
+func (tun *NativeTun) RunningVersion() (version uint32, err error) {
+	return wintun.RunningVersion()
+}
+
+func (rate *rateJuggler) update(packetLen uint64) {
+	now := nanotime()
+	total := atomic.AddUint64(&rate.nextByteCount, packetLen)
+	period := uint64(now - atomic.LoadInt64(&rate.nextStartTime))
+	if period >= rateMeasurementGranularity {
+		if !atomic.CompareAndSwapInt32(&rate.changing, 0, 1) {
+			return
+		}
+		atomic.StoreInt64(&rate.nextStartTime, now)
+		atomic.StoreUint64(&rate.current, total*uint64(time.Second/time.Nanosecond)/period)
+		atomic.StoreUint64(&rate.nextByteCount, 0)
+		atomic.StoreInt32(&rate.changing, 0)
+	}
 }
 
 // openDev find and open an interface.
 func openDev(config Config) (ifce *Interface, err error) {
-	// find the device in registry.
-	deviceid, err := getdeviceid(config.PlatformSpecificParams.ComponentID, config.PlatformSpecificParams.InterfaceName)
-	if err != nil {
-		return nil, err
-	}
-	path := "\\\\.\\Global\\" + deviceid + ".tap"
-	pathp, err := syscall.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, err
-	}
-	// type Handle uintptr
-	file, err := syscall.CreateFile(pathp, syscall.GENERIC_READ|syscall.GENERIC_WRITE, uint32(syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE), nil, syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_SYSTEM|syscall.FILE_FLAG_OVERLAPPED, 0)
-	// if err hanppens, close the interface.
-	defer func() {
-		if err != nil {
-			syscall.Close(file)
-		}
-		if err := recover(); err != nil {
-			syscall.Close(file)
-		}
-	}()
-	if err != nil {
-		return nil, err
-	}
-	var bytesReturned uint32
-
-	// find the mac address of tap device, use this to find the name of interface
-	mac := make([]byte, 6)
-	err = syscall.DeviceIoControl(file, tap_win_ioctl_get_mac, &mac[0], uint32(len(mac)), &mac[0], uint32(len(mac)), &bytesReturned, nil)
-	if err != nil {
-		return nil, err
+	if config.DeviceType != TUN {
+		return nil, errors.New("only tun is implemented for windows")
 	}
 
-	// fd := os.NewFile(uintptr(file), path)
-	ro, err := newOverlapped()
+	if config.Name == "" {
+		config.Name = "Tun01"
+	}
+
+	wt, err := wintun.CreateAdapter(config.Name, "Wintun", nil)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("Error creating interface: %w", err)
 	}
-	wo, err := newOverlapped()
+
+	forcedMTU := 1420
+	// if mtu > 0 {
+	// 	forcedMTU = mtu
+	// }
+
+	tun := &NativeTun{
+		wt:        wt,
+		name:      config.Name,
+		handle:    windows.InvalidHandle,
+		events:    make(chan Event, 10),
+		forcedMTU: forcedMTU,
+	}
+
+	tun.session, err = wt.StartSession(0x800000) // Ring capacity, 8 MiB
 	if err != nil {
-		return
+		tun.wt.Close()
+		close(tun.events)
+		return nil, fmt.Errorf("Error starting session: %w", err)
 	}
-	fd := &wfile{fd: file, ro: ro, wo: wo}
-	ifce = &Interface{isTAP: (config.DeviceType == TAP), ReadWriteCloser: fd}
+	tun.readWait = tun.session.ReadWaitEvent()
 
-	// bring up device.
-	if err := setStatus(file, true); err != nil {
-		return nil, err
-	}
-
-	//TUN
-	if config.DeviceType == TUN {
-		if err := setTUN(file, config.PlatformSpecificParams.Network); err != nil {
-			return nil, err
-		}
+	ifce = &Interface{
+		isTAP:           config.DeviceType == TAP,
+		ReadWriteCloser: tun,
 	}
 
-	// find the name of tap interface(u need it to set the ip or other command)
-	ifces, err := net.Interfaces()
-	if err != nil {
-		return
-	}
-
-	for _, v := range ifces {
-		if len(v.HardwareAddr) < 6 {
-			continue
-		}
-		if bytes.Equal(v.HardwareAddr[:6], mac[:6]) {
-			ifce.name = v.Name
-			return
-		}
-	}
-
-	return nil, errIfceNameNotFound
+	return ifce, nil
 }
