@@ -236,6 +236,7 @@ func openDev(config Config) (ifce *Interface, err error) {
 	ifce = &Interface{
 		isTAP:           config.DeviceType == TAP,
 		ReadWriteCloser: tun,
+		name: config.Name,
 	}
 
 	return ifce, nil
